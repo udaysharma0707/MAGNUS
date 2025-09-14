@@ -1,6 +1,6 @@
 // app.js - improved mobile-friendly client with JSONP queue & background send
 // IMPORTANT: set ENDPOINT to your Apps Script web app URL and SHARED_TOKEN to the secret above
-const ENDPOINT = "https://script.google.com/macros/s/AKfycbwB6JIO5LOGWkwwMscmGOmfSVjjJTPDOZZn0oJ18ArsKasCx-InIIMNrrsEfR3GKylXcA/exec";
+const ENDPOINT = "https://script.google.com/macros/s/AKfycbyAGZaHB7o7POi86Obu99fdxDrTTHxFyF0qhz0c5CPTPRSt8cMMz1qffp9tlCwmz5IpVQ/exec";
 const SHARED_TOKEN = "shopSecret2025";
 const KEY_QUEUE = "car_entry_queue_v1";
 
@@ -34,7 +34,6 @@ function uppercaseExceptServices(fd) {
 function formatCarRegistration(raw) {
   if (!raw) return raw;
   var s = raw.toString().toUpperCase().replace(/[^A-Z0-9]/g, "");
-  // try main regex: 1-2 letters, 1-2 digits, 0-6 letters/digits, 4 digits
   var re = /^([A-Z]{1,2})(\d{1,2})([A-Z0-9]{0,6})(\d{4})$/;
   var m = s.match(re);
   if (m) {
@@ -43,7 +42,6 @@ function formatCarRegistration(raw) {
     var part3 = m[4];
     return part1 + " " + part2 + " " + part3;
   }
-  // fallback: if ends with 4 digits, split them and put space before last4
   var last4 = s.match(/(\d{4})$/);
   if (last4) {
     var last4Digits = last4[1];
@@ -74,7 +72,6 @@ function jsonpRequest(url, timeoutMs) {
         if (s && s.parentNode) s.parentNode.removeChild(s);
       }
     };
-    // ensure callback param not present already
     url = url.replace(/(&|\?)?callback=[^&]*/i, "");
     var full = url + (url.indexOf('?') === -1 ? '?' : '&') + 'callback=' + encodeURIComponent(cbName);
     var script = document.createElement('script');
@@ -96,15 +93,12 @@ function jsonpRequest(url, timeoutMs) {
       reject(new Error('JSONP timeout'));
     }, timeoutMs);
 
-    // On successful load but no callback invoked (server returned HTML or login page),
-    // we wait a short grace period then fail clearly.
     script.onload = function() {
-      // if callback hasn't been invoked within 1200ms after load, assume invalid response
       setTimeout(function(){
         if (!called) {
           try { delete window[cbName]; } catch(e){}
           if (script.parentNode) script.parentNode.removeChild(script);
-          reject(new Error('JSONP loaded but callback never called — server may be returning HTML or a login page (check web app permissions).'));
+          reject(new Error('JSONP loaded but callback never called — server may be returning HTML/login page or wrong ENDPOINT.'));
         }
       }, 1200);
     };
@@ -134,7 +128,7 @@ function sendToServerJSONP(formData, clientTs) {
   var base = ENDPOINT;
   var url = base + (base.indexOf('?') === -1 ? '?' : '&') + params.join("&");
   if (url.length > 1900) return Promise.reject(new Error("Payload too large for JSONP"));
-  return jsonpRequest(url, 20000);
+  return jsonpRequest(url, 25000);
 }
 
 function queueSubmission(formData){
@@ -209,11 +203,98 @@ function clearForm(){
   } catch(e){ console.warn('clearForm error', e); }
 }
 
-// ---------- DOM bindings (safe for mobile) ----------
+// Expose clearForm globally for index fallback
+window.clearForm = clearForm;
+
+// ---------- Main submit flow (exposed as window.submitForm) ----------
+async function doSubmitFlow() {
+  try {
+    updateStatus();
+
+    var submitBtn = document.getElementById('submitBtn');
+    if (submitBtn) {
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Saving...';
+    }
+
+    // Basic client validation (extra safety)
+    var carReg = document.getElementById('carRegistrationNo').value.trim();
+    var servicesChecked = document.querySelectorAll('.service:checked');
+    var amount = document.getElementById('amountPaid').value.trim();
+    var modeChecked = document.querySelectorAll('.mode:checked');
+
+    if (carReg === "") { alert("Car registration number is required."); if (submitBtn) { submitBtn.disabled=false; submitBtn.textContent='Submit'; } return; }
+    if (!servicesChecked || servicesChecked.length === 0) { alert("Please select at least one service."); if (submitBtn) { submitBtn.disabled=false; submitBtn.textContent='Submit'; } return; }
+    if (amount === "") { alert("Amount paid by customer is required."); if (submitBtn) { submitBtn.disabled=false; submitBtn.textContent='Submit'; } return; }
+    if (!modeChecked || modeChecked.length === 0) { alert("Please select at least one mode of payment."); if (submitBtn) { submitBtn.disabled=false; submitBtn.textContent='Submit'; } return; }
+
+    // collect
+    var formData = collectFormData();
+    formData.carRegistrationNo = formatCarRegistration(formData.carRegistrationNo);
+    formData = uppercaseExceptServices(formData);
+
+    // quick visible feedback
+    if (submitBtn) {
+      setTimeout(()=>{ if (submitBtn) { submitBtn.textContent = 'Submit'; submitBtn.disabled = false; } }, 700);
+    }
+
+    showMessage('Submitted — registering...');
+    clearForm();
+
+    // background send
+    (async function backgroundSend() {
+      try {
+        if (navigator.onLine) {
+          try { await flushQueue(); } catch(e){ console.warn('flushQueue err', e); }
+          try {
+            const clientTs = Date.now();
+            const resp = await sendToServerJSONP(formData, clientTs);
+            if (resp && resp.success) {
+              showMessage('Saved — Serial: ' + resp.serial);
+            } else if (resp && resp.error) {
+              showMessage('Server rejected: ' + resp.error);
+              console.warn('Server rejected:', resp.error);
+            } else {
+              queueSubmission(formData);
+              showMessage('Saved locally (server busy). Will sync later.');
+            }
+          } catch (errSend) {
+            console.warn('send failed -> queueing', errSend);
+            if (errSend && errSend.message && errSend.message.indexOf('callback never called') !== -1) {
+              showMessage('Network/server problem — check web app deployment & permissions. Changes saved locally.');
+              console.error('JSONP callback not invoked — likely web app not accessible (needs "Anyone, even anonymous" access or correct ENDPOINT).');
+            } else {
+              showMessage('Network error — saved locally.');
+            }
+            queueSubmission(formData);
+          }
+          try { await flushQueue(); } catch(e){}
+        } else {
+          queueSubmission(formData);
+          showMessage('Offline — saved locally and will sync when online.');
+        }
+      } catch (bgErr) {
+        console.error('backgroundSend unexpected', bgErr);
+        try { queueSubmission(formData); } catch(e){}
+        showMessage('Error occurred — saved locally.');
+      }
+    })();
+
+  } catch (ex) {
+    console.error('submit handler exception', ex);
+    showMessage('Unexpected error. Try again.');
+    var submitBtn = document.getElementById('submitBtn');
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Submit'; }
+  }
+}
+// Expose submitForm globally so index.js can call it
+window.submitForm = doSubmitFlow;
+
+// ---------- DOM wiring (attach touch/click listeners) ----------
 document.addEventListener('DOMContentLoaded', function() {
   updateStatus();
 
-  // --- New: attempt to remove any old service workers & clear caches so mobile gets latest files ---
+  // Attempt to remove any old service workers & clear caches (helps mobile fetch fresh files)
   (async function unregisterSWandClearCaches() {
     try {
       if ('serviceWorker' in navigator) {
@@ -228,7 +309,6 @@ document.addEventListener('DOMContentLoaded', function() {
           try { await caches.delete(k); console.log('deleted cache', k); } catch(e){}
         }
       }
-      // small delay to allow browser to release caches
       await new Promise(r=>setTimeout(r, 200));
     } catch(e) {
       console.warn('SW/cache cleanup failed', e);
@@ -249,88 +329,6 @@ document.addEventListener('DOMContentLoaded', function() {
   // Prevent double-handling between touchend and click
   let ignoreNextClick = false;
 
-  async function doSubmitFlow() {
-    try {
-      // Basic client validation
-      var carReg = document.getElementById('carRegistrationNo').value.trim();
-      var servicesChecked = document.querySelectorAll('.service:checked');
-      var amount = document.getElementById('amountPaid').value.trim();
-      var modeChecked = document.querySelectorAll('.mode:checked');
-
-      if (carReg === "") { alert("Car registration number is required."); return; }
-      if (!servicesChecked || servicesChecked.length === 0) { alert("Please select at least one service."); return; }
-      if (amount === "") { alert("Amount paid by customer is required."); return; }
-      if (!modeChecked || modeChecked.length === 0) { alert("Please select at least one mode of payment."); return; }
-
-      // collect
-      var formData = collectFormData();
-      // format car registration (client-side)
-      formData.carRegistrationNo = formatCarRegistration(formData.carRegistrationNo);
-      // uppercase except services
-      formData = uppercaseExceptServices(formData);
-
-      // immediate visible feedback but short-lived
-      submitBtn.disabled = true;
-      submitBtn.textContent = 'Saving...';
-      setTimeout(()=>{ submitBtn.textContent = 'Submit'; submitBtn.disabled = false; }, 700);
-
-      // clear UI immediately (user asked for this)
-      showMessage('Submitted — registering...');
-      clearForm();
-
-      // background send
-      (async function backgroundSend() {
-        try {
-          if (navigator.onLine) {
-            // flush queued first
-            try { await flushQueue(); } catch(e){ console.warn('flushQueue err', e); }
-            // send current
-            try {
-              const clientTs = Date.now();
-              const resp = await sendToServerJSONP(formData, clientTs);
-              if (resp && resp.success) {
-                showMessage('Saved — Serial: ' + resp.serial);
-              } else if (resp && resp.error) {
-                // server validation error -> show message but do NOT queue
-                showMessage('Server rejected: ' + resp.error);
-                console.warn('Server rejected:', resp.error);
-              } else {
-                // unknown -> queue
-                queueSubmission(formData);
-                showMessage('Saved locally (server busy). Will sync later.');
-              }
-            } catch (errSend) {
-              console.warn('send failed -> queueing', errSend);
-              // helpful diagnostic: if JSONP script failed with message about "callback never called"
-              if (errSend && errSend.message && errSend.message.indexOf('callback never called') !== -1) {
-                showMessage('Network/server problem — check web app deployment & permissions. Changes saved locally.');
-                console.error('JSONP callback not invoked — likely web app not accessible (needs "Anyone, even anonymous" access or correct ENDPOINT).');
-              } else {
-                showMessage('Network error — saved locally.');
-              }
-              queueSubmission(formData);
-            }
-            // try flush again
-            try { await flushQueue(); } catch(e){}
-          } else {
-            queueSubmission(formData);
-            showMessage('Offline — saved locally and will sync when online.');
-          }
-        } catch (bgErr) {
-          console.error('backgroundSend unexpected', bgErr);
-          try { queueSubmission(formData); } catch(e){}
-          showMessage('Error occurred — saved locally.');
-        }
-      })();
-
-    } catch (ex) {
-      console.error('submit handler exception', ex);
-      showMessage('Unexpected error. Try again.');
-      submitBtn.disabled = false; submitBtn.textContent = 'Submit';
-    }
-  }
-
-  // touchend handler to support mobile taps
   function onTouchEndSubmit(ev) {
     if (!ev) return;
     ev.preventDefault && ev.preventDefault();
@@ -345,7 +343,9 @@ document.addEventListener('DOMContentLoaded', function() {
   }
 
   // Attach event listeners (touch first, then click)
-  submitBtn.addEventListener('touchend', onTouchEndSubmit, { passive:false });
+  try {
+    submitBtn.addEventListener('touchend', onTouchEndSubmit, { passive:false });
+  } catch(e){}
   submitBtn.addEventListener('click', onClickSubmit, { passive:false });
 
   // Clear button
@@ -369,6 +369,6 @@ document.addEventListener('DOMContentLoaded', function() {
     } catch(e){}
   }, 300);
 
-}); // DOMContentLoaded end
-
-
+  // Attempt an initial flush (if online)
+  setTimeout(function(){ flushQueue().catch(()=>{}); }, 800);
+});
