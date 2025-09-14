@@ -1,8 +1,9 @@
-// app.js - improved mobile-friendly client with JSONP queue & background send
+// app.js - improved mobile-friendly client with detailed mobile diagnostics + JSONP queue & background send
 // IMPORTANT: set ENDPOINT to your Apps Script web app URL and SHARED_TOKEN to the secret above
 const ENDPOINT = "https://script.google.com/macros/s/AKfycbyAGZaHB7o7POi86Obu99fdxDrTTHxFyF0qhz0c5CPTPRSt8cMMz1qffp9tlCwmz5IpVQ/exec";
 const SHARED_TOKEN = "shopSecret2025";
 const KEY_QUEUE = "car_entry_queue_v1";
+const KEY_LAST_ERROR = "car_entry_last_error_v1";
 
 // ---------- helpers ----------
 function updateStatus() {
@@ -16,6 +17,13 @@ window.addEventListener('offline', ()=>{ updateStatus(); });
 // queue helpers
 function getQueue(){ try { return JSON.parse(localStorage.getItem(KEY_QUEUE) || "[]"); } catch(e){ console.warn('queue parse err', e); return []; } }
 function setQueue(q){ localStorage.setItem(KEY_QUEUE, JSON.stringify(q)); }
+function setLastError(msg) {
+  try { localStorage.setItem(KEY_LAST_ERROR, String(msg || "")); } catch(e){}
+  const dbg = document.getElementById('debugError');
+  if (dbg) dbg.textContent = msg || "";
+  console.log('[LAST_ERROR]', msg);
+}
+function getLastError() { try { return localStorage.getItem(KEY_LAST_ERROR) || ""; } catch(e){ return ""; } }
 
 // Uppercase except services (do not touch services array)
 function uppercaseExceptServices(fd) {
@@ -30,7 +38,7 @@ function uppercaseExceptServices(fd) {
   return fd;
 }
 
-// Format car registration: try to produce "AA NNXXX NNNN" style (state + RTO+letters + last4)
+// Format car registration: same helper you used before
 function formatCarRegistration(raw) {
   if (!raw) return raw;
   var s = raw.toString().toUpperCase().replace(/[^A-Z0-9]/g, "");
@@ -58,9 +66,9 @@ function formatCarRegistration(raw) {
   return s;
 }
 
-// JSONP helper (improved error logging + longer timeout)
+// JSONP helper (more diagnostics)
 function jsonpRequest(url, timeoutMs) {
-  timeoutMs = timeoutMs || 25000; // increased timeout for slow mobile networks
+  timeoutMs = timeoutMs || 25000; // mobile networks sometimes slow
   return new Promise(function(resolve, reject) {
     var cbName = "jsonp_cb_" + Date.now() + "_" + Math.floor(Math.random()*1000000);
     var called = false;
@@ -72,8 +80,19 @@ function jsonpRequest(url, timeoutMs) {
         if (s && s.parentNode) s.parentNode.removeChild(s);
       }
     };
+
+    // ensure we don't accidentally leave a trailing callback param
     url = url.replace(/(&|\?)?callback=[^&]*/i, "");
     var full = url + (url.indexOf('?') === -1 ? '?' : '&') + 'callback=' + encodeURIComponent(cbName);
+
+    // Safety: if URL too long, fail early with a clear message
+    if (full.length > 1900) {
+      var emsg = "Payload too large for JSONP (url length " + full.length + ").";
+      reject(new Error(emsg));
+      setLastError(emsg);
+      return;
+    }
+
     var script = document.createElement('script');
     script.id = cbName;
     script.src = full;
@@ -84,25 +103,35 @@ function jsonpRequest(url, timeoutMs) {
       if (script.parentNode) script.parentNode.removeChild(script);
       var err = new Error('JSONP script load error');
       err.detail = ev || null;
+      setLastError(err.message + (ev ? " (onerror event)" : ""));
       reject(err);
+    };
+
+    // If script loads but the callback never runs (server returned HTML or login page),
+    // we detect that and reject with a clear message.
+    var loadTimer = null;
+    script.onload = function() {
+      // set grace period to allow callback to run
+      loadTimer = setTimeout(function(){
+        if (!called) {
+          try { delete window[cbName]; } catch(e){}
+          if (script.parentNode) script.parentNode.removeChild(script);
+          var em = 'JSONP loaded but callback never called — server may be returning HTML (login page) or invalid response.';
+          setLastError(em + " URL: " + full);
+          reject(new Error(em));
+        }
+      }, 1200);
     };
 
     var timer = setTimeout(function(){
       try { delete window[cbName]; } catch(e){}
       if (script.parentNode) script.parentNode.removeChild(script);
-      reject(new Error('JSONP timeout'));
+      var em = 'JSONP timeout after ' + timeoutMs + 'ms';
+      setLastError(em + " URL len=" + full.length);
+      reject(new Error(em));
     }, timeoutMs);
 
-    script.onload = function() {
-      setTimeout(function(){
-        if (!called) {
-          try { delete window[cbName]; } catch(e){}
-          if (script.parentNode) script.parentNode.removeChild(script);
-          reject(new Error('JSONP loaded but callback never called — server may be returning HTML/login page or wrong ENDPOINT.'));
-        }
-      }, 1200);
-    };
-
+    // cleanup on success path will clear these timers inside callback
     document.body.appendChild(script);
   });
 }
@@ -127,7 +156,12 @@ function sendToServerJSONP(formData, clientTs) {
 
   var base = ENDPOINT;
   var url = base + (base.indexOf('?') === -1 ? '?' : '&') + params.join("&");
-  if (url.length > 1900) return Promise.reject(new Error("Payload too large for JSONP"));
+  if (url.length > 1900) {
+    // explicit rejection here so caller can show a useful message
+    var em = "Payload too large for JSONP (url length " + url.length + "). Try shortening fields.";
+    setLastError(em);
+    return Promise.reject(new Error(em));
+  }
   return jsonpRequest(url, 25000);
 }
 
@@ -151,11 +185,12 @@ async function flushQueue() {
       console.log('[FLUSH] resp', resp);
       if (resp && resp.success) { q.shift(); setQueue(q); await new Promise(r=>setTimeout(r,120)); }
       else {
-        if (resp && resp.error) { alert("Server error during flush: " + resp.error); break; }
+        if (resp && resp.error) { alert("Server error during flush: " + resp.error); setLastError("Server error during flush: " + resp.error); break; }
         break;
       }
     } catch (err) {
       console.warn('[FLUSH] error', err);
+      setLastError('[FLUSH] ' + (err && err.message ? err.message : String(err)));
       break;
     }
     q = getQueue();
@@ -203,116 +238,49 @@ function clearForm(){
   } catch(e){ console.warn('clearForm error', e); }
 }
 
-// Expose clearForm globally for index fallback
-window.clearForm = clearForm;
-
-// ---------- Main submit flow (exposed as window.submitForm) ----------
-async function doSubmitFlow() {
-  try {
-    updateStatus();
-
-    var submitBtn = document.getElementById('submitBtn');
-    if (submitBtn) {
-      submitBtn.disabled = true;
-      submitBtn.textContent = 'Saving...';
-    }
-
-    // Basic client validation (extra safety)
-    var carReg = document.getElementById('carRegistrationNo').value.trim();
-    var servicesChecked = document.querySelectorAll('.service:checked');
-    var amount = document.getElementById('amountPaid').value.trim();
-    var modeChecked = document.querySelectorAll('.mode:checked');
-
-    if (carReg === "") { alert("Car registration number is required."); if (submitBtn) { submitBtn.disabled=false; submitBtn.textContent='Submit'; } return; }
-    if (!servicesChecked || servicesChecked.length === 0) { alert("Please select at least one service."); if (submitBtn) { submitBtn.disabled=false; submitBtn.textContent='Submit'; } return; }
-    if (amount === "") { alert("Amount paid by customer is required."); if (submitBtn) { submitBtn.disabled=false; submitBtn.textContent='Submit'; } return; }
-    if (!modeChecked || modeChecked.length === 0) { alert("Please select at least one mode of payment."); if (submitBtn) { submitBtn.disabled=false; submitBtn.textContent='Submit'; } return; }
-
-    // collect
-    var formData = collectFormData();
-    formData.carRegistrationNo = formatCarRegistration(formData.carRegistrationNo);
-    formData = uppercaseExceptServices(formData);
-
-    // quick visible feedback
-    if (submitBtn) {
-      setTimeout(()=>{ if (submitBtn) { submitBtn.textContent = 'Submit'; submitBtn.disabled = false; } }, 700);
-    }
-
-    showMessage('Submitted — registering...');
-    clearForm();
-
-    // background send
-    (async function backgroundSend() {
-      try {
-        if (navigator.onLine) {
-          try { await flushQueue(); } catch(e){ console.warn('flushQueue err', e); }
-          try {
-            const clientTs = Date.now();
-            const resp = await sendToServerJSONP(formData, clientTs);
-            if (resp && resp.success) {
-              showMessage('Saved — Serial: ' + resp.serial);
-            } else if (resp && resp.error) {
-              showMessage('Server rejected: ' + resp.error);
-              console.warn('Server rejected:', resp.error);
-            } else {
-              queueSubmission(formData);
-              showMessage('Saved locally (server busy). Will sync later.');
-            }
-          } catch (errSend) {
-            console.warn('send failed -> queueing', errSend);
-            if (errSend && errSend.message && errSend.message.indexOf('callback never called') !== -1) {
-              showMessage('Network/server problem — check web app deployment & permissions. Changes saved locally.');
-              console.error('JSONP callback not invoked — likely web app not accessible (needs "Anyone, even anonymous" access or correct ENDPOINT).');
-            } else {
-              showMessage('Network error — saved locally.');
-            }
-            queueSubmission(formData);
-          }
-          try { await flushQueue(); } catch(e){}
-        } else {
-          queueSubmission(formData);
-          showMessage('Offline — saved locally and will sync when online.');
-        }
-      } catch (bgErr) {
-        console.error('backgroundSend unexpected', bgErr);
-        try { queueSubmission(formData); } catch(e){}
-        showMessage('Error occurred — saved locally.');
-      }
-    })();
-
-  } catch (ex) {
-    console.error('submit handler exception', ex);
-    showMessage('Unexpected error. Try again.');
-    var submitBtn = document.getElementById('submitBtn');
-    if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = 'Submit'; }
-  }
-}
-// Expose submitForm globally so index.js can call it
-window.submitForm = doSubmitFlow;
-
-// ---------- DOM wiring (attach touch/click listeners) ----------
+// ---------- DOM bindings (safe for mobile) ----------
 document.addEventListener('DOMContentLoaded', function() {
   updateStatus();
 
-  // Attempt to remove any old service workers & clear caches (helps mobile fetch fresh files)
+  // show last error if any (small debug area)
+  (function showExistingError(){
+    var dbg = document.getElementById('debugError');
+    if (!dbg) {
+      dbg = document.createElement('div');
+      dbg.id = 'debugError';
+      dbg.style.position = 'fixed';
+      dbg.style.left = '8px';
+      dbg.style.bottom = '8px';
+      dbg.style.right = '8px';
+      dbg.style.background = 'rgba(255,230,200,0.95)';
+      dbg.style.color = '#000';
+      dbg.style.padding = '8px';
+      dbg.style.fontSize = '12px';
+      dbg.style.border = '1px solid #e0b45c';
+      dbg.style.borderRadius = '6px';
+      dbg.style.zIndex = 9999;
+      dbg.style.maxHeight = '120px';
+      dbg.style.overflow = 'auto';
+      dbg.title = 'Last network error (tap to clear)';
+      dbg.addEventListener('click', function(){ setLastError(''); dbg.textContent = ''; });
+      document.body.appendChild(dbg);
+    }
+    dbg.textContent = getLastError();
+  })();
+
+  // --- Attempt to unregister SW & clear caches (best-effort) ---
   (async function unregisterSWandClearCaches() {
     try {
       if ('serviceWorker' in navigator) {
         const regs = await navigator.serviceWorker.getRegistrations();
-        for (const r of regs) {
-          try { await r.unregister(); console.log('unregistered SW'); } catch(e){}
-        }
+        for (const r of regs) { try { await r.unregister(); } catch(e){} }
       }
       if ('caches' in window) {
         const keys = await caches.keys();
-        for (const k of keys) {
-          try { await caches.delete(k); console.log('deleted cache', k); } catch(e){}
-        }
+        for (const k of keys) { try { await caches.delete(k); } catch(e){} }
       }
       await new Promise(r=>setTimeout(r, 200));
-    } catch(e) {
-      console.warn('SW/cache cleanup failed', e);
-    }
+    } catch(e) { console.warn('SW/cache cleanup failed', e); }
   })();
 
   const submitBtn = document.getElementById('submitBtn');
@@ -323,11 +291,90 @@ document.addEventListener('DOMContentLoaded', function() {
     return;
   }
 
-  // Ensure button is type=button
   try { submitBtn.setAttribute('type','button'); } catch(e){}
 
-  // Prevent double-handling between touchend and click
   let ignoreNextClick = false;
+
+  async function doSubmitFlow() {
+    try {
+      var carReg = document.getElementById('carRegistrationNo').value.trim();
+      var servicesChecked = document.querySelectorAll('.service:checked');
+      var amount = document.getElementById('amountPaid').value.trim();
+      var modeChecked = document.querySelectorAll('.mode:checked');
+
+      if (carReg === "") { alert("Car registration number is required."); return; }
+      if (!servicesChecked || servicesChecked.length === 0) { alert("Please select at least one service."); return; }
+      if (amount === "") { alert("Amount paid by customer is required."); return; }
+      if (!modeChecked || modeChecked.length === 0) { alert("Please select at least one mode of payment."); return; }
+
+      var formData = collectFormData();
+      formData.carRegistrationNo = formatCarRegistration(formData.carRegistrationNo);
+      formData = uppercaseExceptServices(formData);
+
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Saving...';
+      setTimeout(()=>{ submitBtn.textContent = 'Submit'; submitBtn.disabled = false; }, 700);
+
+      showMessage('Submitted — registering...');
+      clearForm();
+
+      (async function backgroundSend() {
+        try {
+          if (navigator.onLine) {
+            try { await flushQueue(); } catch(e){ console.warn('flushQueue err', e); }
+            try {
+              const clientTs = Date.now();
+              const resp = await sendToServerJSONP(formData, clientTs);
+              if (resp && resp.success) {
+                showMessage('Saved — Serial: ' + resp.serial);
+                setLastError(''); // clear last error on success
+              } else if (resp && resp.error) {
+                showMessage('Server rejected: ' + resp.error);
+                setLastError('Server rejected: ' + resp.error);
+                console.warn('Server rejected:', resp.error);
+              } else {
+                queueSubmission(formData);
+                showMessage('Saved locally (server busy). Will sync later.');
+                setLastError('Unknown server response during submission');
+              }
+            } catch (errSend) {
+              // show a detailed message to the user and save to debug box
+              var emsg = (errSend && errSend.message) ? errSend.message : String(errSend);
+              console.warn('send failed -> queueing', errSend);
+              setLastError('send failed: ' + emsg);
+              // If our code detected payload-too-large, show that explicitly
+              if (emsg && emsg.indexOf('Payload too large') !== -1) {
+                showMessage('Payload too large for JSONP — saved locally. Try shorter text.');
+              } else if (emsg && emsg.indexOf('callback never called') !== -1) {
+                showMessage('Server returned non-JSONP (possibly login page). Check web app deployment. Saved locally.');
+              } else if (emsg && emsg.indexOf('JSONP timeout') !== -1) {
+                showMessage('Network timeout — saved locally.');
+              } else {
+                showMessage('Network error — saved locally.');
+              }
+              queueSubmission(formData);
+            }
+            try { await flushQueue(); } catch(e){}
+          } else {
+            queueSubmission(formData);
+            showMessage('Offline — saved locally and will sync when online.');
+            setLastError('Offline at submit time');
+          }
+        } catch (bgErr) {
+          console.error('backgroundSend unexpected', bgErr);
+          try { queueSubmission(formData); } catch(e){}
+          showMessage('Error occurred — saved locally.');
+          setLastError('backgroundSend unexpected: ' + (bgErr && bgErr.message ? bgErr.message : String(bgErr)));
+        }
+      })();
+
+    } catch (ex) {
+      console.error('submit handler exception', ex);
+      showMessage('Unexpected error. Try again.');
+      submitBtn.disabled = false; submitBtn.textContent = 'Submit';
+      setLastError('submit handler exception: ' + (ex && ex.message ? ex.message : String(ex)));
+    }
+  }
 
   function onTouchEndSubmit(ev) {
     if (!ev) return;
@@ -342,19 +389,15 @@ document.addEventListener('DOMContentLoaded', function() {
     doSubmitFlow();
   }
 
-  // Attach event listeners (touch first, then click)
-  try {
-    submitBtn.addEventListener('touchend', onTouchEndSubmit, { passive:false });
-  } catch(e){}
+  submitBtn.addEventListener('touchend', onTouchEndSubmit, { passive:false });
   submitBtn.addEventListener('click', onClickSubmit, { passive:false });
 
-  // Clear button
   if (clearBtn) {
     clearBtn.addEventListener('touchend', function(ev){ ev && ev.preventDefault(); clearForm(); showMessage('Form cleared'); }, { passive:false });
     clearBtn.addEventListener('click', function(ev){ clearForm(); showMessage('Form cleared'); }, { passive:false });
   }
 
-  // quick overlay check (helpful when mobile layouts accidentally cover button)
+  // quick overlay check
   setTimeout(function(){
     try {
       var rect = submitBtn.getBoundingClientRect();
@@ -369,6 +412,4 @@ document.addEventListener('DOMContentLoaded', function() {
     } catch(e){}
   }, 300);
 
-  // Attempt an initial flush (if online)
-  setTimeout(function(){ flushQueue().catch(()=>{}); }, 800);
-});
+}); // DOMContentLoaded end
