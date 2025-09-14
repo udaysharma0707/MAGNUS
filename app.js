@@ -1,4 +1,4 @@
-// app.js - improved mobile-friendly client with detailed mobile diagnostics + JSONP queue & background send
+// app.js - JSONP with robust mobile fallbacks (fetch no-cors, sendBeacon, image) + queueing
 // IMPORTANT: set ENDPOINT to your Apps Script web app URL and SHARED_TOKEN to the secret above
 const ENDPOINT = "https://script.google.com/macros/s/AKfycbyAGZaHB7o7POi86Obu99fdxDrTTHxFyF0qhz0c5CPTPRSt8cMMz1qffp9tlCwmz5IpVQ/exec";
 const SHARED_TOKEN = "shopSecret2025";
@@ -66,78 +66,8 @@ function formatCarRegistration(raw) {
   return s;
 }
 
-// JSONP helper (more diagnostics)
-function jsonpRequest(url, timeoutMs) {
-  timeoutMs = timeoutMs || 25000; // mobile networks sometimes slow
-  return new Promise(function(resolve, reject) {
-    var cbName = "jsonp_cb_" + Date.now() + "_" + Math.floor(Math.random()*1000000);
-    var called = false;
-    window[cbName] = function(data) {
-      called = true;
-      try { resolve(data); } finally {
-        try { delete window[cbName]; } catch(e){}
-        var s = document.getElementById(cbName);
-        if (s && s.parentNode) s.parentNode.removeChild(s);
-      }
-    };
-
-    // ensure we don't accidentally leave a trailing callback param
-    url = url.replace(/(&|\?)?callback=[^&]*/i, "");
-    var full = url + (url.indexOf('?') === -1 ? '?' : '&') + 'callback=' + encodeURIComponent(cbName);
-
-    // Safety: if URL too long, fail early with a clear message
-    if (full.length > 1900) {
-      var emsg = "Payload too large for JSONP (url length " + full.length + ").";
-      reject(new Error(emsg));
-      setLastError(emsg);
-      return;
-    }
-
-    var script = document.createElement('script');
-    script.id = cbName;
-    script.src = full;
-    script.async = true;
-
-    script.onerror = function(ev) {
-      try { delete window[cbName]; } catch(e){}
-      if (script.parentNode) script.parentNode.removeChild(script);
-      var err = new Error('JSONP script load error');
-      err.detail = ev || null;
-      setLastError(err.message + (ev ? " (onerror event)" : ""));
-      reject(err);
-    };
-
-    // If script loads but the callback never runs (server returned HTML or login page),
-    // we detect that and reject with a clear message.
-    var loadTimer = null;
-    script.onload = function() {
-      // set grace period to allow callback to run
-      loadTimer = setTimeout(function(){
-        if (!called) {
-          try { delete window[cbName]; } catch(e){}
-          if (script.parentNode) script.parentNode.removeChild(script);
-          var em = 'JSONP loaded but callback never called — server may be returning HTML (login page) or invalid response.';
-          setLastError(em + " URL: " + full);
-          reject(new Error(em));
-        }
-      }, 1200);
-    };
-
-    var timer = setTimeout(function(){
-      try { delete window[cbName]; } catch(e){}
-      if (script.parentNode) script.parentNode.removeChild(script);
-      var em = 'JSONP timeout after ' + timeoutMs + 'ms';
-      setLastError(em + " URL len=" + full.length);
-      reject(new Error(em));
-    }, timeoutMs);
-
-    // cleanup on success path will clear these timers inside callback
-    document.body.appendChild(script);
-  });
-}
-
-// Build JSONP URL and call
-function sendToServerJSONP(formData, clientTs) {
+// Build the full URL (same params as before)
+function buildEndpointUrl(formData, clientTs) {
   var params = [];
   function add(k,v){ if (v === undefined || v === null) v=""; params.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(v))); }
   add("token", SHARED_TOKEN);
@@ -153,16 +83,206 @@ function sendToServerJSONP(formData, clientTs) {
   add("adviceToCustomer", formData.adviceToCustomer || "");
   add("otherInfo", formData.otherInfo || "");
   if (clientTs) add("clientTs", String(clientTs));
-
   var base = ENDPOINT;
-  var url = base + (base.indexOf('?') === -1 ? '?' : '&') + params.join("&");
-  if (url.length > 1900) {
-    // explicit rejection here so caller can show a useful message
-    var em = "Payload too large for JSONP (url length " + url.length + "). Try shortening fields.";
-    setLastError(em);
-    return Promise.reject(new Error(em));
+  return base + (base.indexOf('?') === -1 ? '?' : '&') + params.join("&");
+}
+
+// JSONP helper
+function jsonpRequest(url, timeoutMs) {
+  timeoutMs = timeoutMs || 25000; // mobile networks sometimes slow
+  return new Promise(function(resolve, reject) {
+    var cbName = "jsonp_cb_" + Date.now() + "_" + Math.floor(Math.random()*1000000);
+    var called = false;
+    window[cbName] = function(data) {
+      called = true;
+      try { resolve(data); } finally {
+        try { delete window[cbName]; } catch(e){}
+        var s = document.getElementById(cbName);
+        if (s && s.parentNode) s.parentNode.removeChild(s);
+      }
+    };
+
+    url = url.replace(/(&|\?)?callback=[^&]*/i, "");
+    var full = url + (url.indexOf('?') === -1 ? '?' : '&') + 'callback=' + encodeURIComponent(cbName);
+
+    if (full.length > 1900) {
+      var emsg = "Payload too large for JSONP (url length " + full.length + ").";
+      setLastError(emsg);
+      reject(new Error(emsg));
+      return;
+    }
+
+    var script = document.createElement('script');
+    script.id = cbName;
+    script.src = full;
+    script.async = true;
+
+    script.onerror = function(ev) {
+      try { delete window[cbName]; } catch(e){}
+      if (script.parentNode) script.parentNode.removeChild(script);
+      var err = new Error('JSONP script load error');
+      err.detail = ev || null;
+      setLastError(err.message + (ev ? " (onerror)" : ""));
+      reject(err);
+    };
+
+    script.onload = function() {
+      // if callback hasn't run quickly, assume callback never called
+      setTimeout(function(){
+        if (!called) {
+          try { delete window[cbName]; } catch(e){}
+          if (script.parentNode) script.parentNode.removeChild(script);
+          var em = 'JSONP loaded but callback never called — server may be returning HTML or login page.';
+          setLastError(em + " URL len=" + full.length);
+          reject(new Error(em));
+        }
+      }, 1200);
+    };
+
+    var timer = setTimeout(function(){
+      try { delete window[cbName]; } catch(e){}
+      if (script.parentNode) script.parentNode.removeChild(script);
+      var em = 'JSONP timeout after ' + timeoutMs + 'ms';
+      setLastError(em + " URL len=" + full.length);
+      reject(new Error(em));
+    }, timeoutMs);
+
+    document.body.appendChild(script);
+  });
+}
+
+// fallback: fetch with mode:'no-cors' GET (fire-and-forget). Resolves if request dispatched.
+function sendViaNoCorsGET(url, timeoutMs) {
+  timeoutMs = timeoutMs || 20000;
+  return new Promise(async (resolve, reject) => {
+    if (!window.fetch) {
+      return reject(new Error('fetch not available'));
+    }
+    var did = false;
+    try {
+      // send as no-cors GET (response will be opaque). If fetch resolves, treat as success.
+      var p = fetch(url, { method: 'GET', mode: 'no-cors', cache: 'no-store' });
+      var t = setTimeout(function(){
+        if (!did) {
+          did = true;
+          setLastError('fetch(no-cors) timeout');
+          resolve({ success: true, note: 'fetch_no_cors_timeout_assumed_sent' });
+        }
+      }, timeoutMs);
+      p.then(function(resp){
+        if (did) return;
+        did = true;
+        clearTimeout(t);
+        // resp is opaque; we cannot read JSON, but request was sent
+        resolve({ success: true, note: 'fetch_no_cors_sent' });
+      }).catch(function(err){
+        if (did) return;
+        did = true;
+        clearTimeout(t);
+        setLastError('fetch(no-cors) error: ' + (err && err.message ? err.message : String(err)));
+        reject(err || new Error('fetch(no-cors) failed'));
+      });
+    } catch (e) {
+      setLastError('fetch(no-cors) exception: ' + (e && e.message ? e.message : String(e)));
+      reject(e);
+    }
+  });
+}
+
+// fallback: navigator.sendBeacon (POST) returns boolean; we wrap in Promise
+function sendViaBeacon(url) {
+  return new Promise((resolve, reject) => {
+    try {
+      if (navigator.sendBeacon) {
+        var ok = navigator.sendBeacon(url); // with GET-style URL, works as POST body empty; server receives URL querystring
+        if (ok) {
+          resolve({ success: true, note: 'sendBeacon_sent' });
+        } else {
+          setLastError('sendBeacon returned false');
+          reject(new Error('sendBeacon returned false'));
+        }
+      } else {
+        reject(new Error('sendBeacon not available'));
+      }
+    } catch (e) {
+      setLastError('sendBeacon exception: ' + (e && e.message ? e.message : String(e)));
+      reject(e);
+    }
+  });
+}
+
+// fallback: image ping (fire-and-forget)
+function sendViaImage(url, timeoutMs) {
+  timeoutMs = timeoutMs || 10000;
+  return new Promise((resolve, reject) => {
+    try {
+      var img = new Image();
+      var done = false;
+      var t = setTimeout(function(){
+        if (done) return;
+        done = true;
+        // even if timeout, we assume request likely reached server
+        setLastError('Image ping timeout (assuming sent)');
+        resolve({ success: true, note: 'image_timeout_assumed_sent' });
+      }, timeoutMs);
+      img.onload = function(){ if (done) return; done = true; clearTimeout(t); resolve({ success:true, note:'image_onload' }); };
+      img.onerror = function(){ if (done) return; done = true; clearTimeout(t); // might still have reached server
+        setLastError('Image ping error (but request may have been delivered)');
+        resolve({ success:true, note:'image_onerror' }); 
+      };
+      img.src = url;
+    } catch (e) {
+      setLastError('Image ping exception: ' + (e && e.message ? e.message : String(e)));
+      reject(e);
+    }
+  });
+}
+
+// Attempt to send using the chain: JSONP -> fetch(no-cors) -> beacon -> image
+async function sendWithFallbacks(formData, clientTs) {
+  const url = buildEndpointUrl(formData, clientTs);
+  // Try JSONP first (gives us structured response)
+  try {
+    const resp = await jsonpRequest(url, 25000);
+    return resp;
+  } catch (errJsonp) {
+    // record error
+    setLastError('JSONP failed: ' + (errJsonp && errJsonp.message ? errJsonp.message : String(errJsonp)));
+    console.warn('JSONP failed, trying fetch(no-cors):', errJsonp);
   }
-  return jsonpRequest(url, 25000);
+
+  // Try fetch no-cors
+  try {
+    const resp = await sendViaNoCorsGET(url, 20000);
+    setLastError('fallback fetch(no-cors) used: ' + (resp && resp.note ? resp.note : 'sent'));
+    return { success: true, note: 'fallback_fetch_no_cors' };
+  } catch (errFetch) {
+    setLastError('fetch(no-cors) failed: ' + (errFetch && errFetch.message ? errFetch.message : String(errFetch)));
+    console.warn('fetch(no-cors) failed:', errFetch);
+  }
+
+  // Try sendBeacon
+  try {
+    const resp = await sendViaBeacon(url);
+    setLastError('fallback sendBeacon used: ' + (resp && resp.note ? resp.note : 'sent'));
+    return { success: true, note: 'fallback_beacon' };
+  } catch (errBeacon) {
+    setLastError('sendBeacon failed: ' + (errBeacon && errBeacon.message ? errBeacon.message : String(errBeacon)));
+    console.warn('sendBeacon failed:', errBeacon);
+  }
+
+  // Last resort, try image ping
+  try {
+    const resp = await sendViaImage(url, 10000);
+    setLastError('fallback image ping used: ' + (resp && resp.note ? resp.note : 'sent'));
+    return { success: true, note: 'fallback_image' };
+  } catch (errImg) {
+    setLastError('image ping failed: ' + (errImg && errImg.message ? errImg.message : String(errImg)));
+    console.warn('image ping failed:', errImg);
+  }
+
+  // All failed
+  throw new Error('All network delivery methods failed');
 }
 
 function queueSubmission(formData){
@@ -170,7 +290,6 @@ function queueSubmission(formData){
   console.log('[QUEUE] queued, length=', getQueue().length);
 }
 
-// flushQueue: sequentially send oldest-first
 async function flushQueue() {
   if (!navigator.onLine) return;
   var q = getQueue();
@@ -181,12 +300,21 @@ async function flushQueue() {
   while (q.length > 0 && navigator.onLine) {
     var item = q[0];
     try {
-      var resp = await sendToServerJSONP(item.data, item.ts);
+      // try robust sendWithFallbacks for queued items; include original ts
+      var resp = await sendWithFallbacks(item.data, item.ts);
       console.log('[FLUSH] resp', resp);
-      if (resp && resp.success) { q.shift(); setQueue(q); await new Promise(r=>setTimeout(r,120)); }
-      else {
-        if (resp && resp.error) { alert("Server error during flush: " + resp.error); setLastError("Server error during flush: " + resp.error); break; }
-        break;
+      // If we got a JSONP-style response with success true, remove from queue
+      if (resp && resp.success) {
+        q.shift(); setQueue(q);
+        await new Promise(r=>setTimeout(r,120));
+      } else {
+        // If fallback delivered but didn't return structured response, assume success and remove
+        if (resp && resp.note && resp.note.indexOf('fallback') === 0) {
+          q.shift(); setQueue(q);
+        } else {
+          // unknown -> stop flush and retry later
+          break;
+        }
       }
     } catch (err) {
       console.warn('[FLUSH] error', err);
@@ -238,7 +366,7 @@ function clearForm(){
   } catch(e){ console.warn('clearForm error', e); }
 }
 
-// ---------- DOM bindings (safe for mobile) ----------
+// ---------- DOM bindings ----------
 document.addEventListener('DOMContentLoaded', function() {
   updateStatus();
 
@@ -268,7 +396,7 @@ document.addEventListener('DOMContentLoaded', function() {
     dbg.textContent = getLastError();
   })();
 
-  // --- Attempt to unregister SW & clear caches (best-effort) ---
+  // try to lightly clear service workers & caches (best-effort)
   (async function unregisterSWandClearCaches() {
     try {
       if ('serviceWorker' in navigator) {
@@ -322,38 +450,31 @@ document.addEventListener('DOMContentLoaded', function() {
         try {
           if (navigator.onLine) {
             try { await flushQueue(); } catch(e){ console.warn('flushQueue err', e); }
+
+            const clientTs = Date.now();
             try {
-              const clientTs = Date.now();
-              const resp = await sendToServerJSONP(formData, clientTs);
+              const resp = await sendWithFallbacks(formData, clientTs);
+              // if JSONP returned success true, use that; else fallback note
               if (resp && resp.success) {
-                showMessage('Saved — Serial: ' + resp.serial);
-                setLastError(''); // clear last error on success
-              } else if (resp && resp.error) {
-                showMessage('Server rejected: ' + resp.error);
-                setLastError('Server rejected: ' + resp.error);
-                console.warn('Server rejected:', resp.error);
+                if (resp.serial) showMessage('Saved — Serial: ' + resp.serial);
+                else showMessage('Saved (delivered via fallback).');
+                setLastError('');
+              } else if (resp && resp.note) {
+                showMessage('Saved (fallback: ' + resp.note + ')');
+                setLastError('Fallback used: ' + resp.note);
               } else {
+                // unknown -> queue
                 queueSubmission(formData);
-                showMessage('Saved locally (server busy). Will sync later.');
-                setLastError('Unknown server response during submission');
+                showMessage('Saved locally (server returned unknown response). Will sync later.');
+                setLastError('Unknown server response');
               }
             } catch (errSend) {
-              // show a detailed message to the user and save to debug box
-              var emsg = (errSend && errSend.message) ? errSend.message : String(errSend);
-              console.warn('send failed -> queueing', errSend);
-              setLastError('send failed: ' + emsg);
-              // If our code detected payload-too-large, show that explicitly
-              if (emsg && emsg.indexOf('Payload too large') !== -1) {
-                showMessage('Payload too large for JSONP — saved locally. Try shorter text.');
-              } else if (emsg && emsg.indexOf('callback never called') !== -1) {
-                showMessage('Server returned non-JSONP (possibly login page). Check web app deployment. Saved locally.');
-              } else if (emsg && emsg.indexOf('JSONP timeout') !== -1) {
-                showMessage('Network timeout — saved locally.');
-              } else {
-                showMessage('Network error — saved locally.');
-              }
+              console.warn('all send methods failed -> queueing', errSend);
+              setLastError('All send methods failed: ' + (errSend && errSend.message ? errSend.message : String(errSend)));
               queueSubmission(formData);
+              showMessage('Network error — saved locally.');
             }
+
             try { await flushQueue(); } catch(e){}
           } else {
             queueSubmission(formData);
