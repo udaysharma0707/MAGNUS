@@ -28,9 +28,8 @@
       padding:14px;
       box-sizing:border-box;
       box-shadow: 0 6px 18px rgba(0,0,0,0.15);
-      position: relative; /* <-- needed so sheet-link can be placed top-right inside container */
+      position: relative;
     }
-    /* Google Sheet link (top-right) */
     .sheet-link {
       position: absolute;
       top: 12px;
@@ -97,6 +96,17 @@
 
     /* Hide Q4 by default */
     #qtyWrapper { display:none; }
+
+    /* Diagnostic box for endpoint/ping */
+    .diag {
+      font-size:12px;
+      color:#333;
+      margin-bottom:8px;
+      background:#fff;
+      padding:6px 8px;
+      border-radius:6px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+    }
   </style>
 </head>
 <body>
@@ -105,6 +115,10 @@
     <a class="sheet-link"
        href="https://docs.google.com/spreadsheets/d/1Ky6EjufwhQ3RGnHIS0E-f5bf1wqlF7VKHtLIC1Tdu7Y/edit"
        target="_blank" rel="noopener" aria-label="Open Google sheet">Google sheet</a>
+
+    <!-- diag: shows which ENDPOINT this loaded page is using and ping result -->
+    <div id="diag" class="diag" aria-hidden="false">Endpoint: (checking...)</div>
+
     <h1>Car Entry</h1>
 
     <label class="q-label">1. Car registration no.</label>
@@ -156,42 +170,89 @@
     <div class="small" style="margin-top:6px">Status: <span id="status-duplicate" style="display:none"></span></div>
   </div>
 
-  <script src="app.js"></script>
-  <script>
-    // Show/Hide Q4 based on services selected
-    const serviceCheckboxes = document.querySelectorAll('.service');
-    const qtyWrapper = document.getElementById('qtyWrapper');
+  <!-- version-busted script load so mobile fetches newest file when you bump v= -->
+  <script src="app.js?v=1"></script>
 
-    serviceCheckboxes.forEach(cb => {
-      cb.addEventListener('change', () => {
-        const showQty = Array.from(serviceCheckboxes).some(el =>
+  <script>
+    // Show/Hide Q4 based on services selected (and run once on load)
+    (function(){
+      const serviceCheckboxes = Array.from(document.querySelectorAll('.service'));
+      const qtyWrapper = document.getElementById('qtyWrapper');
+      function refresh() {
+        const showQty = serviceCheckboxes.some(el =>
           el.checked && (el.value === "Tires sold" || el.value === "Wheel Cover sold")
         );
         qtyWrapper.style.display = showQty ? 'block' : 'none';
+      }
+      serviceCheckboxes.forEach(cb => cb.addEventListener('change', refresh));
+      refresh();
+    })();
+
+    // Simple client-side required checks before submission — final submission handled by app.js
+    (function(){
+      const submitBtn = document.getElementById('submitBtn');
+      submitBtn.addEventListener('click', function(){
+        const amountPaid = document.getElementById('amountPaid').value.trim();
+        const paymentModes = document.querySelectorAll('.mode:checked');
+        const servicesChecked = document.querySelectorAll('.service:checked');
+        const carReg = document.getElementById('carRegistrationNo').value.trim();
+
+        if (carReg === "") { alert("Car registration number is required."); return; }
+        if (!servicesChecked || servicesChecked.length === 0) { alert("Please select at least one service."); return; }
+        if (!amountPaid) { alert("Amount paid by customer is required."); return; }
+        if (paymentModes.length === 0) { alert("Please select at least one mode of payment."); return; }
+
+        // call the submit handler inside app.js (it exposes window.submitForm)
+        if (typeof window.submitForm === "function") {
+          window.submitForm();
+        } else {
+          // fallback: dispatch a click to the button (app.js attaches handlers on DOMContentLoaded too)
+          submitBtn.dispatchEvent(new Event('click'));
+        }
       });
-    });
 
-    // Form validation before submit
-    document.getElementById('submitBtn').addEventListener('click', () => {
-      const amountPaid = document.getElementById('amountPaid').value.trim();
-      const paymentModes = document.querySelectorAll('.mode:checked');
+      // Clear button: just call app.js clear function if present
+      const clearBtn = document.getElementById('clearBtn');
+      clearBtn.addEventListener('click', function(){
+        if (typeof window.clearForm === "function") window.clearForm();
+        else {
+          // fallback local clear
+          try {
+            document.getElementById('carRegistrationNo').value='';
+            document.getElementById('carName').value='';
+            document.querySelectorAll('.service').forEach(ch=>ch.checked=false);
+            document.getElementById('qtyTiresWheelCoverSold').value='';
+            document.getElementById('amountPaid').value='';
+            document.querySelectorAll('.mode').forEach(ch=>ch.checked=false);
+            document.getElementById('kmsTravelled').value='';
+            document.getElementById('adviceToCustomer').value='';
+            document.getElementById('otherInfo').value='';
+          } catch(e){}
+        }
+      });
+    })();
 
-      if (!amountPaid) {
-        alert("Amount paid by customer is required.");
-        return;
-      }
-      if (paymentModes.length === 0) {
-        alert("Please select at least one mode of payment.");
-        return;
-      }
-
-      // If passes, call app.js submit logic
-      if (typeof submitForm === "function") {
-        submitForm();
-      }
-    });
+    // Diagnostic ping: if app.js defines ENDPOINT, ping it to show if the loaded page is using correct endpoint.
+    (function(){
+      var diag = document.getElementById('diag');
+      setTimeout(function(){
+        try {
+          if (typeof ENDPOINT === 'undefined') { diag.textContent = 'ENDPOINT not found in loaded JS'; return; }
+          diag.textContent = 'Using ENDPOINT: ' + ENDPOINT + ' — pinging...';
+          var cb = 'diag_cb_' + Date.now();
+          window[cb] = function(d){
+            diag.textContent = 'Using ENDPOINT: ' + ENDPOINT + ' — ping OK';
+            try { delete window[cb]; } catch(e){}
+          };
+          var s = document.createElement('script');
+          s.src = ENDPOINT + (ENDPOINT.indexOf('?')===-1 ? '?' : '&') + 'ping=1&callback=' + cb;
+          s.onerror = function(){ diag.textContent = 'Using ENDPOINT: ' + ENDPOINT + ' — ping failed (script load error)'; };
+          document.body.appendChild(s);
+        } catch(e){
+          diag.textContent = 'Diag error: ' + (e && e.message ? e.message : e);
+        }
+      }, 200);
+    })();
   </script>
 </body>
 </html>
-
-
